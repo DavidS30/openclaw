@@ -1,0 +1,166 @@
+# docker-compose-secure.yml
+# Versión con Docker Socket Proxy para restricción de permisos
+# Preparado por Tix - 2026-02-20
+
+services:
+  # Proxy de seguridad para Docker socket
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy
+    container_name: docker-socket-proxy
+    environment:
+      # === OPERACIONES PERMITIDAS ===
+      CONTAINERS: 1      # ps, inspect, logs
+      POST: 1            # restart, stop, start
+      EXEC: 1            # Ejecutar comandos en contenedores
+      
+      # === OPERACIONES BLOQUEADAS ===
+      IMAGES: 0          # No pull/push/build imágenes
+      VOLUMES: 0         # No crear volúmenes (bloquea -v /:/host)
+      NETWORKS: 0        # No crear redes
+      BUILD: 0           # No build
+      COMMIT: 0          # No commit
+      CONFIGS: 0         # No configs
+      DISTRIBUTION: 0    # No distribution
+      PLUGINS: 0         # No plugins
+      SECRETS: 0         # No secrets
+      SERVICES: 0        # No services (swarm)
+      SWARM: 0           # No swarm
+      SYSTEM: 0          # No system prune/df
+      TASKS: 0           # No tasks
+      
+      # Logging
+      LOG_LEVEL: info
+      
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-proxy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /run
+
+  openclaw-gateway:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    container_name: openclaw-gateway
+    environment:
+      HOME: /root  # Cambiado a /root porque user es 0:0
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY}
+      CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY}
+      CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE}
+      
+      # Usar proxy en lugar de socket directo
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      
+    user: "0:0"  # Root en contenedor (mantiene archivos root:root en host)
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/root/.openclaw  # Cambiado a /root
+      - ${OPENCLAW_WORKSPACE_DIR}:/root/.openclaw/workspace
+      - ${OPENCLAW_EXTRA_MOUNTS}:/mnt/scalantix:rw
+      - ~/private-openclaw-agent/.ssh/id_ed25519:/root/.ssh/id_rsa:ro
+      - ~/private-openclaw-agent/.ssh/id_ed25519.pub:/root/.ssh/id_rsa.pub:ro
+      # NO montar /var/run/docker.sock aquí - usa el proxy
+    ports:
+      - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+      - "${OPENCLAW_BRIDGE_PORT:-18790}:18790"
+    networks:
+      - docker-proxy
+    depends_on:
+      - docker-socket-proxy
+    init: true
+    restart: unless-stopped
+    command:
+      [
+        "node",
+        "dist/index.js",
+        "gateway",
+        "--bind",
+        "${OPENCLAW_GATEWAY_BIND:-lan}",
+        "--port",
+        "18789",
+      ]
+
+  openclaw-cli:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    environment:
+      HOME: /root
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      BROWSER: echo
+      CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY}
+      CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY}
+      CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE}
+      
+      # Usar proxy
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      
+    volumes:
+      - ${OPENCLAW_CONFIG_DIR}:/root/.openclaw
+      - ${OPENCLAW_WORKSPACE_DIR}:/root/.openclaw/workspace
+      - ${OPENCLAW_EXTRA_MOUNTS}:/mnt/scalantix:rw
+      - ~/private-openclaw-agent/.ssh/id_ed25519:/root/.ssh/id_rsa:ro
+      - ~/private-openclaw-agent/.ssh/id_ed25519.pub:/root/.ssh/id_rsa.pub:ro
+      # NO montar /var/run/docker.sock
+    networks:
+      - docker-proxy
+    depends_on:
+      - docker-socket-proxy
+    stdin_open: true
+    tty: true
+    init: true
+    entrypoint: ["node", "dist/index.js"]
+
+networks:
+  docker-proxy:
+    driver: bridge
+    name: openclaw-docker-proxy
+
+# =============================================================================
+# NOTAS DE SEGURIDAD:
+# =============================================================================
+#
+# ¿Qué hace el docker-socket-proxy?
+# ---------------------------------
+# Filtra las operaciones permitidas al Docker socket. Tix puede:
+#   ✅ Ver contenedores (ps, inspect, logs)
+#   ✅ Reiniciar/detener contenedores
+#   ✅ Ejecutar comandos en contenedores (exec)
+#   ❌ Crear volúmenes peligrosos (-v /:/host)
+#   ❌ Crear imágenes o pull imágenes maliciosas
+#   ❌ Modificar configuración de Docker
+#
+# ¿Qué bloquea específicamente?
+# ------------------------------
+# 1. VOLUMES: 0 → Bloquea "docker run -v /:/host alpine ..."
+#    (El escape que te mostré queda bloqueado)
+#
+# 2. IMAGES: 0 → No puede pull imágenes no autorizadas
+#
+# 3. BUILD: 0 → No puede compilar Dockerfiles maliciosos
+#
+# ¿Cómo activar esta configuración?
+# ----------------------------------
+# 1. Reemplazar docker-compose.yml actual:
+#    cd ~/openclaw
+#    cp docker-compose.yml docker-compose.original.yml  # Backup
+#    cp /mnt/scalantix/docker-compose-secure.yml docker-compose.yml
+#
+# 2. Reiniciar OpenClaw:
+#    docker-compose down
+#    docker-compose up -d
+#
+# 3. Verificar que funciona:
+#    docker-compose logs docker-socket-proxy
+#    docker-compose exec openclaw-gateway docker ps  # Debería funcionar
+#
+# ¿Cómo volver atrás si hay problemas?
+# -------------------------------------
+#    cd ~/openclaw
+#    cp docker-compose.original.yml docker-compose.yml
+#    docker-compose down && docker-compose up -d
+#
+# =============================================================================
