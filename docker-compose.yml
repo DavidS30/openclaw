@@ -11,6 +11,12 @@ services:
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - /root/scalantix:/mnt/scalantix:rw
+      - ~/private-openclaw-agent/.ssh/id_ed25519:/home/node/.ssh/id_rsa:ro
+      - ~/private-openclaw-agent/.ssh/id_ed25519.pub:/home/node/.ssh/id_rsa.pub:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "988"
     ports:
       - "${OPENCLAW_GATEWAY_PORT:-18789}:18789"
       - "${OPENCLAW_BRIDGE_PORT:-18790}:18790"
@@ -40,6 +46,10 @@ services:
     volumes:
       - ${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw
       - ${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace
+      - /root/scalantix:/mnt/scalantix:rw
+      - ~/private-openclaw-agent/.ssh/id_ed25519:/home/node/.ssh/id_rsa:ro
+      - ~/private-openclaw-agent/.ssh/id_ed25519.pub:/home/node/.ssh/id_rsa.pub:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     stdin_open: true
     tty: true
     init: true
