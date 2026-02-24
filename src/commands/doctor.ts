@@ -29,7 +29,7 @@ import {
 import { doctorShellCompletion } from "./doctor-completion.js";
 import { loadAndMaybeMigrateDoctorConfig } from "./doctor-config-flow.js";
 import { maybeRepairGatewayDaemon } from "./doctor-gateway-daemon-flow.js";
-import { checkGatewayHealth } from "./doctor-gateway-health.js";
+import { checkGatewayHealth, probeGatewayMemoryStatus } from "./doctor-gateway-health.js";
 import {
   maybeRepairGatewayServiceConfig,
   maybeScanExtraGatewayServices,
@@ -98,6 +98,8 @@ export async function doctorCommand(
     confirm: (p) => prompter.confirm(p),
   });
   let cfg: OpenClawConfig = configResult.cfg;
+  const cfgForPersistence = structuredClone(cfg);
+  const sourceConfigValid = configResult.sourceConfigValid ?? true;
 
   const configPath = configResult.path ?? CONFIG_PATH;
   if (!cfg.gateway?.mode) {
@@ -123,19 +125,15 @@ export async function doctorCommand(
   if (gatewayDetails.remoteFallbackNote) {
     note(gatewayDetails.remoteFallbackNote, "Gateway");
   }
-  if (resolveMode(cfg) === "local") {
-    const gatewayBind = cfg.gateway?.bind ?? "loopback";
-    const tailscaleMode = cfg.gateway?.tailscale?.mode ?? "off";
-    const requireGatewayAuth = gatewayBind !== "loopback" || tailscaleMode !== "off";
+  if (resolveMode(cfg) === "local" && sourceConfigValid) {
     const auth = resolveGatewayAuth({
       authConfig: cfg.gateway?.auth,
-      tailscaleMode,
+      tailscaleMode: cfg.gateway?.tailscale?.mode ?? "off",
     });
-    const needsToken =
-      requireGatewayAuth && auth.mode !== "password" && (auth.mode !== "token" || !auth.token);
+    const needsToken = auth.mode !== "password" && (auth.mode !== "token" || !auth.token);
     if (needsToken) {
       note(
-        "Gateway auth is off or missing a token. Token auth is recommended when the gateway is exposed beyond local loopback.",
+        "Gateway auth is off or missing a token. Token auth is now the recommended default (including loopback).",
         "Gateway auth",
       );
       const shouldSetToken =
@@ -266,7 +264,6 @@ export async function doctorCommand(
   }
 
   noteWorkspaceStatus(cfg);
-  await noteMemorySearchHealth(cfg);
 
   // Check and fix shell completion
   await doctorShellCompletion(runtime, prompter, {
@@ -278,6 +275,13 @@ export async function doctorCommand(
     cfg,
     timeoutMs: options.nonInteractive === true ? 3000 : 10_000,
   });
+  const gatewayMemoryProbe = healthOk
+    ? await probeGatewayMemoryStatus({
+        cfg,
+        timeoutMs: options.nonInteractive === true ? 3000 : 10_000,
+      })
+    : { checked: false, ready: false };
+  await noteMemorySearchHealth(cfg, { gatewayMemoryProbe });
   await maybeRepairGatewayDaemon({
     cfg,
     runtime,
@@ -287,7 +291,8 @@ export async function doctorCommand(
     healthOk,
   });
 
-  const shouldWriteConfig = prompter.shouldRepair || configResult.shouldWriteConfig;
+  const shouldWriteConfig =
+    configResult.shouldWriteConfig || JSON.stringify(cfg) !== JSON.stringify(cfgForPersistence);
   if (shouldWriteConfig) {
     cfg = applyWizardMetadata(cfg, { command: "doctor", mode: resolveMode(cfg) });
     await writeConfigFile(cfg);
@@ -296,7 +301,7 @@ export async function doctorCommand(
     if (fs.existsSync(backupPath)) {
       runtime.log(`Backup: ${shortenHomePath(backupPath)}`);
     }
-  } else {
+  } else if (!prompter.shouldRepair) {
     runtime.log(`Run "${formatCliCommand("openclaw doctor --fix")}" to apply changes.`);
   }
 

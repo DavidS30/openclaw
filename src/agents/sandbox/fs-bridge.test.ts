@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./docker.js", () => ({
@@ -26,9 +29,16 @@ function createSandbox(overrides?: Partial<SandboxContext>): SandboxContext {
 
 describe("sandbox fs bridge shell compatibility", () => {
   beforeEach(() => {
-    mockedExecDockerRaw.mockReset();
+    mockedExecDockerRaw.mockClear();
     mockedExecDockerRaw.mockImplementation(async (args) => {
       const script = args[5] ?? "";
+      if (script.includes('readlink -f -- "$cursor"')) {
+        return {
+          stdout: Buffer.from(`${String(args.at(-2) ?? "")}\n`),
+          stderr: Buffer.alloc(0),
+          code: 0,
+        };
+      }
       if (script.includes('stat -c "%F|%s|%Y"')) {
         return {
           stdout: Buffer.from("regular file|1|2"),
@@ -67,8 +77,20 @@ describe("sandbox fs bridge shell compatibility", () => {
     const executables = mockedExecDockerRaw.mock.calls.map(([args]) => args[3] ?? "");
 
     expect(executables.every((shell) => shell === "sh")).toBe(true);
-    expect(scripts.every((script) => script.includes("set -eu;"))).toBe(true);
+    expect(scripts.every((script) => /set -eu[;\n]/.test(script))).toBe(true);
     expect(scripts.some((script) => script.includes("pipefail"))).toBe(false);
+  });
+
+  it("resolveCanonicalContainerPath script is valid POSIX sh (no do; token)", async () => {
+    const bridge = createSandboxFsBridge({ sandbox: createSandbox() });
+
+    await bridge.readFile({ filePath: "a.txt" });
+
+    const scripts = mockedExecDockerRaw.mock.calls.map(([args]) => args[5] ?? "");
+    const canonicalScript = scripts.find((script) => script.includes("allow_final"));
+    expect(canonicalScript).toBeDefined();
+    // "; " joining can create "do; cmd", which is invalid in POSIX sh.
+    expect(canonicalScript).not.toMatch(/\bdo;/);
   });
 
   it("resolves bind-mounted absolute container paths for reads", async () => {
@@ -102,5 +124,57 @@ describe("sandbox fs bridge shell compatibility", () => {
       bridge.writeFile({ filePath: "/workspace-two/new.txt", data: "hello" }),
     ).rejects.toThrow(/read-only/);
     expect(mockedExecDockerRaw).not.toHaveBeenCalled();
+  });
+
+  it("rejects pre-existing host symlink escapes before docker exec", async () => {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-fs-bridge-"));
+    const workspaceDir = path.join(stateDir, "workspace");
+    const outsideDir = path.join(stateDir, "outside");
+    const outsideFile = path.join(outsideDir, "secret.txt");
+    await fs.mkdir(workspaceDir, { recursive: true });
+    await fs.mkdir(outsideDir, { recursive: true });
+    await fs.writeFile(outsideFile, "classified");
+    await fs.symlink(outsideFile, path.join(workspaceDir, "link.txt"));
+
+    const bridge = createSandboxFsBridge({
+      sandbox: createSandbox({
+        workspaceDir,
+        agentWorkspaceDir: workspaceDir,
+      }),
+    });
+
+    await expect(bridge.readFile({ filePath: "link.txt" })).rejects.toThrow(/Symlink escapes/);
+    expect(mockedExecDockerRaw).not.toHaveBeenCalled();
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+
+  it("rejects container-canonicalized paths outside allowed mounts", async () => {
+    mockedExecDockerRaw.mockImplementation(async (args) => {
+      const script = args[5] ?? "";
+      if (script.includes('readlink -f -- "$cursor"')) {
+        return {
+          stdout: Buffer.from("/etc/passwd\n"),
+          stderr: Buffer.alloc(0),
+          code: 0,
+        };
+      }
+      if (script.includes('cat -- "$1"')) {
+        return {
+          stdout: Buffer.from("content"),
+          stderr: Buffer.alloc(0),
+          code: 0,
+        };
+      }
+      return {
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.alloc(0),
+        code: 0,
+      };
+    });
+
+    const bridge = createSandboxFsBridge({ sandbox: createSandbox() });
+    await expect(bridge.readFile({ filePath: "a.txt" })).rejects.toThrow(/escapes allowed mounts/i);
+    const scripts = mockedExecDockerRaw.mock.calls.map(([args]) => args[5] ?? "");
+    expect(scripts.some((script) => script.includes('cat -- "$1"'))).toBe(false);
   });
 });
